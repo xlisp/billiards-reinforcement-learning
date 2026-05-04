@@ -1,0 +1,39 @@
+{
+  "mastery": {
+    "stance": 0.12384620052324162,
+    "aim_straight": 0.0,
+    "ghost_ball": 0.0,
+    "squat_check": 0.0,
+    "power_control": 0.0,
+    "english": 0.0,
+    "bank_shot": 0.0,
+    "position_play": 0.0,
+    "thin_cut": 0.0,
+    "jump_shot": 0.0,
+    "pinch_shot": 0.0,
+    "snooker_make": 0.0,
+    "snooker_escape": 0.0,
+    "threat_handle": 0.0,
+    "doubles_team": 0.0,
+    "hail_mary": 0.0,
+    "tempo_routine": 0.0,
+    "integrated_jin": 0.0,
+    "be_water": 0.0,
+    "vs_strong": 0.0
+  },
+  "history": [
+    {
+      "before": 0.0,
+      "after": 0.004,
+      "delta": 0.0037,
+      "session": [
+        "stance"
+      ],
+      "gains": {
+        "stance": 0.1239
+      },
+      "challenge": "FAIL",
+      "challenge_target": "stance"
+    }
+  ]
+}
