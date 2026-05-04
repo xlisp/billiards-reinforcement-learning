@@ -1,417 +1,481 @@
-"""自我训练框架：用小模型训练你大脑这个大模型 (Self-Trainer for the Brain).
+"""桌球大脑模型自训练框架 (PyTorch)
 
-核心思想（对应 README §9.3 与 §17–§20）
-----------------------------------------
-- **大模型 (BrainModel)**：你大脑里的整体桌球直觉——所有子技能的加权聚合。无法直接训练。
-- **小模型 (SkillModule)**：单一参数 / 单一技能的专项小模型——可以直接通过定向训练提升。
-  例：直线瞄准、薄球、走位、低杆、解斯诺克……每个都是一个"参数"。
-- **课程设计 (CurriculumDesigner)**：把小模型组合成阶段化课程——基础 → 进阶 → 战术 → 实战。
-- **对抗者 (Adversary)**：小模型扮演"挑战者"，专挑你最弱的技能出难题——
-  小模型"打败"大模型 → 大模型被迫提升那一参数 → 整体水平上一个台阶。
-- **自我训练循环 (SelfTrainer)**：每轮 ① 诊断弱项 ② 设计小模型 ③ 训练小模型
-  ④ 集成回大模型 ⑤ 对抗验证 ⑥ 记录 → 重复。
+把 README 的核心思想"用小模型训练你大脑这个大模型"实现成可运行的神经网络系统：
+
+    [小模型 SkillExpert] × N  →  [大脑模型 BrainModel = MoE]  ⇄  [对抗者 Adversary]
+              ↑                            ↑                          ↓
+         各自定向训练               门控蒸馏整合各专家           生成专攻弱点的难题
+
+四个组成部分
+------------
+1. **SkillExpert（小模型）**：每个 expert = 一个专项小网络（直线 / 薄球 / 反袋 / 解斯诺克 / 走位），
+   只在自己擅长的局面上训练——参数少、专注、好训。
+
+2. **BrainModel（大模型 = 大脑）**：Mixture-of-Experts 结构——
+   - 门控网络 (gating) 看局面决定调用哪个 expert（或加权混合）
+   - 蒸馏阶段：各 expert 教大脑"什么局面该怎么打"
+   - 这就是"用小模型训练大模型"
+
+3. **Adversary（对抗者）**：自我设计的小生成网络，专挑大脑弱点出难题——
+   maximize_φ  E_z [ Loss( BrainModel( G_φ(z) ) ) ]
+   "小模型打败大模型训练"——大脑被强迫提升弱项。
+
+4. **Curriculum（阶段化组合）**：
+   Stage 1 各 expert 单独预训练 → Stage 2 蒸馏到大脑 → Stage 3 对抗微调 →
+   反复诊断弱 expert → 重训弱 expert → 重蒸馏 → ……
 
 跑法
 ----
-    python brain_trainer.py            # 跑一次完整自我训练循环（按当前 mastery 推荐课程）
-    python brain_trainer.py --plan 7   # 生成 7 天训练计划
-    python brain_trainer.py --eval     # 只评估当前大脑模型的水平，不训练
-    python brain_trainer.py --reset    # 清空进度从头来
-
-进度持久化在 ./brain_state.json。这是给"你"用的训练助手——AI 不是在打球，是在帮你设计训练。
+    python brain_trainer.py                 # 默认完整自训练循环
+    python brain_trainer.py --epochs 50
+    python brain_trainer.py --device cpu    # 或 cuda / mps
+    python brain_trainer.py --no-adversary  # 关闭对抗训练对照
+    python brain_trainer.py --eval-only --ckpt brain.pt
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
-STATE_PATH = Path(__file__).with_name("brain_state.json")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+CKPT_PATH = Path(__file__).with_name("brain.pt")
+TABLE_W, TABLE_H = 2.54, 1.27   # 标准九球台尺寸（米）
+BALL_R = 0.028
+POCKETS = torch.tensor([
+    [0.0, 0.0], [TABLE_W / 2, 0.0], [TABLE_W, 0.0],
+    [0.0, TABLE_H], [TABLE_W / 2, TABLE_H], [TABLE_W, TABLE_H],
+])  # 6 个袋口
+
+SCENARIO_DIM = 10   # cue(2) + target(2) + pocket(2) + obstacle(2) + has_obstacle(1) + scenario_type(1)
+ACTION_DIM = 2      # angle, force
 
 
 # ---------------------------------------------------------------------------
-# 1. SkillModule —— 小模型：单一技能 / 单一参数
+# 1. 场景生成器 —— 合成训练数据 (scenario, optimal_action)
 # ---------------------------------------------------------------------------
-@dataclass
-class SkillModule:
-    """一个小模型 = 一个可独立训练、可独立评估的技能参数。
+SCENARIO_TYPES = ["straight", "thin_cut", "bank_shot", "snooker_escape", "position"]
 
-    mastery (0.0–1.0) 就是这个参数当前的"权重"。BrainModel 把所有 mastery 加权聚合
-    成整体水平。训练这个小模型 = 提升 mastery。
+
+def _ghost_ball(target: torch.Tensor, pocket: torch.Tensor) -> torch.Tensor:
+    """鬼球法：从目标球沿 (袋口→目标球) 方向反延伸一个球径。"""
+    direction = target - pocket
+    norm = direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return target + direction / norm * (2 * BALL_R)
+
+
+def _optimal_action(cue: torch.Tensor, target: torch.Tensor, pocket: torch.Tensor) -> torch.Tensor:
+    """几何最优动作 (angle_norm, force_norm)，用作监督训练的 ground truth。"""
+    ghost = _ghost_ball(target, pocket)
+    delta = ghost - cue
+    angle = torch.atan2(delta[..., 1], delta[..., 0]) / math.pi  # → [-1, 1]
+    distance = (target - cue).norm(dim=-1)
+    # 距离越远要越大力，且加上目标→袋口距离
+    force = torch.tanh(0.4 * (distance + (pocket - target).norm(dim=-1)))
+    return torch.stack([angle, force], dim=-1)
+
+
+def sample_scenarios(n: int, scenario_type: str | None = None,
+                     seed: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """生成 n 个 (scenario, optimal_action) 对。
+
+    scenario_type 限定只生成某类——用于训练专项 expert。None = 混合。
+    """
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+
+    cue = torch.rand(n, 2, generator=g) * torch.tensor([TABLE_W, TABLE_H])
+    target = torch.rand(n, 2, generator=g) * torch.tensor([TABLE_W, TABLE_H])
+    # 防止 cue 和 target 重叠
+    target = target + (target - cue).sign() * 0.1
+
+    # 每个场景挑一个最近的袋口
+    pocket_idx = torch.argmin(torch.cdist(target, POCKETS), dim=1)
+    pocket = POCKETS[pocket_idx]
+
+    obstacle = torch.rand(n, 2, generator=g) * torch.tensor([TABLE_W, TABLE_H])
+    has_obstacle = torch.zeros(n)
+    type_idx = torch.zeros(n)
+
+    types = [scenario_type] * n if scenario_type else \
+            [SCENARIO_TYPES[i % len(SCENARIO_TYPES)] for i in range(n)]
+
+    for i, t in enumerate(types):
+        type_idx[i] = SCENARIO_TYPES.index(t)
+        if t == "straight":
+            # 让 cue, target, pocket 接近共线
+            mid = (cue[i] + pocket[i]) / 2
+            target[i] = mid + torch.randn(2, generator=g) * 0.05
+        elif t == "thin_cut":
+            # 让母球和袋口在目标球同侧但成大角度
+            offset = torch.randn(2, generator=g)
+            offset = offset / offset.norm() * 0.4
+            cue[i] = target[i] + offset
+        elif t == "bank_shot":
+            # 目标球贴库
+            if torch.rand(1, generator=g).item() > 0.5:
+                target[i, 1] = BALL_R + 0.02
+            else:
+                target[i, 1] = TABLE_H - BALL_R - 0.02
+        elif t == "snooker_escape":
+            # 障碍球放在 cue→target 之间
+            t_pos = 0.4 + 0.2 * torch.rand(1, generator=g).item()
+            obstacle[i] = cue[i] * (1 - t_pos) + target[i] * t_pos
+            obstacle[i] += torch.randn(2, generator=g) * 0.03
+            has_obstacle[i] = 1.0
+        elif t == "position":
+            # 位置球：和 straight 类似但走位要求高（这里特征上加权重）
+            pass
+
+    # 归一化到 [-1, 1]
+    def norm_pos(p: torch.Tensor) -> torch.Tensor:
+        return p / torch.tensor([TABLE_W, TABLE_H]) * 2 - 1
+
+    actions = _optimal_action(cue, target, pocket)
+    scenario = torch.cat([
+        norm_pos(cue), norm_pos(target), norm_pos(pocket), norm_pos(obstacle),
+        has_obstacle.unsqueeze(-1), (type_idx / len(SCENARIO_TYPES)).unsqueeze(-1),
+    ], dim=-1)
+    return scenario, actions
+
+
+# ---------------------------------------------------------------------------
+# 2. SkillExpert —— 小模型，每个专攻一类场景
+# ---------------------------------------------------------------------------
+class SkillExpert(nn.Module):
+    """一个 expert = 一个专项小 MLP。参数量很小、训练容易、容易调优。"""
+
+    def __init__(self, name: str, hidden: int = 32):
+        super().__init__()
+        self.name = name
+        self.net = nn.Sequential(
+            nn.Linear(SCENARIO_DIM, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, ACTION_DIM), nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# 3. BrainModel —— 大模型 = Mixture of Experts
+# ---------------------------------------------------------------------------
+class BrainModel(nn.Module):
+    """大脑 = 门控网络 + 一组 expert + 自身的 baseline 头。
+
+    forward 时：gating 看场景决定每个 expert 权重 → 加权融合 expert 输出 →
+    再过一个小的 refinement head 输出最终动作。这是"小模型们共同训练大模型"的核心。
     """
 
-    name: str
-    cn_name: str
-    section: str           # 在 README 里对应章节
-    difficulty: float       # 难度系数（0 = 基础动作，1 = 顶级技巧）
-    prerequisites: list[str] = field(default_factory=list)
-    drills: list[str] = field(default_factory=list)
-    mastery: float = 0.0    # 当前掌握度（小模型的"训练权重"）
+    def __init__(self, expert_names: list[str], hidden: int = 64):
+        super().__init__()
+        self.experts = nn.ModuleDict({n: SkillExpert(n) for n in expert_names})
+        self.expert_names = expert_names
+        self.gating = nn.Sequential(
+            nn.Linear(SCENARIO_DIM, hidden), nn.ReLU(),
+            nn.Linear(hidden, len(expert_names)),
+        )
+        self.refine = nn.Sequential(
+            nn.Linear(ACTION_DIM + SCENARIO_DIM, hidden), nn.ReLU(),
+            nn.Linear(hidden, ACTION_DIM), nn.Tanh(),
+        )
 
-    def is_unlockable(self, brain: "BrainModel") -> bool:
-        """小模型解锁条件：所有先修技能 mastery >= 0.4（早期可并行渐进）"""
-        return all(brain.skills[p].mastery >= 0.4 for p in self.prerequisites)
+    def expert_outputs(self, x: torch.Tensor) -> torch.Tensor:
+        """形状 (B, n_experts, ACTION_DIM)"""
+        return torch.stack([self.experts[n](x) for n in self.expert_names], dim=1)
 
-    def expected_gain(self) -> float:
-        """每轮训练这个小模型预期提升多少 mastery（边际递减）。"""
-        # 越难的技能学习曲线越陡；越熟练的技能边际递减
-        room = 1.0 - self.mastery
-        difficulty_penalty = 1.0 - 0.4 * self.difficulty
-        return 0.08 * room * difficulty_penalty
+    def gate_weights(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softmax(self.gating(x), dim=-1)
 
-    def train_one_round(self, intensity: float = 1.0) -> float:
-        """跑一轮训练：返回 mastery 增量。intensity 是"今天练多少"的强度系数。"""
-        gain = self.expected_gain() * intensity
-        # 加入随机噪声（人类训练本来就不稳定）
-        gain *= random.uniform(0.7, 1.2)
-        self.mastery = min(1.0, self.mastery + gain)
-        return gain
-
-
-# ---------------------------------------------------------------------------
-# 2. BrainModel —— 大模型：你的大脑 = 所有 SkillModule 的加权聚合
-# ---------------------------------------------------------------------------
-@dataclass
-class BrainModel:
-    skills: dict[str, SkillModule] = field(default_factory=dict)
-    history: list[dict] = field(default_factory=list)
-
-    @classmethod
-    def fresh(cls) -> "BrainModel":
-        """初始化一个新的大脑模型——所有小模型 mastery = 0。
-
-        小模型清单对应 README 的章节，按难度和依赖关系组织。
-        """
-        skills_def = [
-            # name, cn, section, difficulty, prereqs, drills
-            ("stance",        "站姿与手架",      "§1.1–1.2", 0.10, [],
-             ["双脚 45° 站位 50 次", "V 槽稳定持续 30 秒 ×10 组", "钟摆出杆空挥 100 次"]),
-            ("aim_straight",  "直线瞄准",       "§2",        0.15, ["stance"],
-             ["直线球 100 颗（近 → 远）", "闭眼出杆直线球 30 颗", "节拍器 60 BPM 出杆 50 次"]),
-            ("ghost_ball",    "鬼球透视法",      "§2.1–2.3",  0.30, ["aim_straight"],
-             ["硬币标记接触点 50 颗", "三档基准球（1/4, 1/2, 3/4）各 30 颗", "同袋异位 40 颗"]),
-            ("squat_check",   "蹲位投影验证",    "§2.7",      0.25, ["ghost_ball"],
-             ["蹲位 + 站位双视角 30 颗", "1/4 / 1/2 / 3/4 投影记忆训练"]),
-            ("power_control", "力度控制",       "§4–5",      0.30, ["aim_straight"],
-             ["三档力度（轻/中/大）走位 50 颗", "落点精度训练 ±20cm 30 次"]),
-            ("english",       "高低杆 / 跟缩",   "§9.2.4",    0.45, ["power_control"],
-             ["纯中杆/高杆/低杆三档 60 颗", "走位叫位训练 40 次"]),
-            ("bank_shot",     "反袋 / 库边",    "§3, §15",   0.50, ["aim_straight", "power_control"],
-             ["固定母球反袋 50 颗", "近距离 / 远距离反袋各 30 颗"]),
-            ("position_play", "连续走位 / 清台", "§9",        0.55, ["english", "power_control"],
-             ["3 球清台 ×20 局", "倒推法预读两颗球 30 局", "母球走短不走长训练"]),
-            ("thin_cut",      "薄球",          "§5",        0.60, ["ghost_ball", "power_control"],
-             ["1/4 球以下薄球 50 颗", "贴库薄球 30 颗"]),
-            ("jump_shot",     "跳球",          "§6, §15",   0.70, ["english"],
-             ["近距离跳球（落袋玩法）30 次", "杆角 30°/45°/60° 各 10 次"]),
-            ("pinch_shot",    "搓杆 / 戳杆",    "§7",        0.75, ["english"],
-             ["贴球状态戳杆 30 次", "录像检查动作合法性"]),
-            ("snooker_make",  "做斯诺克",       "§13",       0.60, ["position_play"],
-             ["设定情景做斯诺克 20 次", "对方视角验证障碍 20 次"]),
-            ("snooker_escape","解斯诺克 / 脱围", "§15",       0.65, ["bank_shot", "english"],
-             ["库边绕一库 20 次", "低杆撞库脱围 20 次"]),
-            ("threat_handle", "处理威胁球",      "§19",       0.55, ["thin_cut", "position_play"],
-             ["切线轻顶贴袋球 30 次", "borrowing combo 20 次"]),
-            ("doubles_team",  "双打配合",       "§14",       0.50, ["position_play", "snooker_make"],
-             ["送队友好球训练 30 次", "无声沟通训练 20 局"]),
-            ("hail_mary",     "败势解局",       "§16",       0.55, ["snooker_make", "threat_handle"],
-             ["撞散对方球群训练 20 次", "锁球策略 20 次"]),
-            ("tempo_routine", "预击球流程",     "§12.2",     0.20, ["stance"],
-             ["固定 2-3 次引杆 100 杆", "节拍器训练 14 天"]),
-            ("integrated_jin","松沉稳劲整劲",   "§17, §18.1", 0.65, ["tempo_routine", "english"],
-             ["慢动作出杆体会劲路 50 次", "录侧面视频检查中轴 10 次"]),
-            ("be_water",      "局面随变心法",   "§18.2",     0.80, ["integrated_jin", "position_play", "snooker_make"],
-             ["每杆 3 问练习 100 杆", "节奏 flow↔crash 切换训练"]),
-            ("vs_strong",     "抗高手三档决策",  "§20",       0.85, ["be_water", "snooker_escape", "threat_handle"],
-             ["和高手对局复盘 ×10 局", "三档决策模拟训练"]),
-        ]
-        skills = {
-            name: SkillModule(
-                name=name, cn_name=cn, section=sec, difficulty=diff,
-                prerequisites=prereqs, drills=drills,
-            )
-            for name, cn, sec, diff, prereqs, drills in skills_def
-        }
-        return cls(skills=skills)
-
-    def overall_score(self) -> float:
-        """大模型整体水平——按难度加权的 mastery 平均。难技能权重高。"""
-        total_w, weighted = 0.0, 0.0
-        for s in self.skills.values():
-            w = 0.5 + s.difficulty
-            total_w += w
-            weighted += w * s.mastery
-        return weighted / total_w if total_w else 0.0
-
-    def weakest_unlockable(self, k: int = 3) -> list[SkillModule]:
-        """找出当前可训练但最弱的 k 个小模型——这是下轮训练的目标。"""
-        candidates = [s for s in self.skills.values()
-                      if s.is_unlockable(self) and s.mastery < 0.95]
-        candidates.sort(key=lambda s: (s.mastery, s.difficulty))
-        return candidates[:k]
-
-    def stage(self) -> str:
-        """根据 overall_score 返回当前所处的训练阶段。"""
-        s = self.overall_score()
-        if s < 0.20: return "Stage 1：基本功（站姿 + 直线球 + 透视瞄准）"
-        if s < 0.40: return "Stage 2：进阶杆法（高低杆 + 力度 + 反袋）"
-        if s < 0.60: return "Stage 3：连续清台（走位 + 薄球 + 预击球流程）"
-        if s < 0.80: return "Stage 4：战术对局（斯诺克 + 解斯诺克 + 威胁球）"
-        return "Stage 5：心法与抗高手（松沉稳劲 + Be water + 三档决策）"
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        outs = self.expert_outputs(x)            # (B, E, A)
+        w = self.gate_weights(x).unsqueeze(-1)    # (B, E, 1)
+        fused = (outs * w).sum(dim=1)             # (B, A)
+        return self.refine(torch.cat([fused, x], dim=-1))
 
 
 # ---------------------------------------------------------------------------
-# 3. Adversary —— 小模型扮演挑战者，专攻你的弱点
+# 4. Adversary —— 小生成网络，造难题打败大脑
 # ---------------------------------------------------------------------------
-@dataclass
-class Adversary:
-    """对抗式小模型：每轮挑你最弱的小模型出难题，"打败"大模型。
-    被打败 → 倒逼你训练那个小模型 → 大模型整体提升。
+class Adversary(nn.Module):
+    """从噪声 z 生成场景，目标是最大化 brain 的预测误差。
+
+    这就是"训练关键参数小模型去打败大模型训练"——
+    它生成的难题反过来训练大脑（取它生成的场景 + 几何最优作为新一轮训练数据）。
     """
 
-    @staticmethod
-    def challenge(brain: BrainModel) -> dict:
-        """生成一个针对当前最弱小模型的挑战。"""
-        weakest = brain.weakest_unlockable(1)
-        if not weakest:
-            return {"verdict": "PASS", "msg": "当前没有可训练的弱项——继续保持。"}
+    def __init__(self, z_dim: int = 8, hidden: int = 32):
+        super().__init__()
+        self.z_dim = z_dim
+        self.net = nn.Sequential(
+            nn.Linear(z_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, SCENARIO_DIM), nn.Tanh(),  # 场景特征已归一到 [-1,1]
+        )
 
-        target = weakest[0]
-        # 大模型在这个技能上的胜率（vs 对抗者难度 = 该技能难度 + 0.1）
-        adversary_skill = min(1.0, target.difficulty + 0.10)
-        win_prob = max(0.0, target.mastery - adversary_skill * 0.5)
-        win_prob = min(1.0, win_prob + 0.3)
-        defeated = random.random() > win_prob
+    def forward(self, batch: int, device: torch.device) -> torch.Tensor:
+        z = torch.randn(batch, self.z_dim, device=device)
+        return self.net(z)
 
-        return {
-            "verdict": "FAIL" if defeated else "PASS",
-            "target": target.name,
-            "target_cn": target.cn_name,
-            "section": target.section,
-            "current_mastery": target.mastery,
-            "adversary_difficulty": adversary_skill,
-            "win_prob": win_prob,
-            "msg": (f"对抗者攻你最弱的【{target.cn_name}】(§{target.section})——"
-                    f"当前 mastery={target.mastery:.2f}, 胜率={win_prob:.0%}, "
-                    f"{'被打败 → 必须强化这一项' if defeated else '勉强守住——但仍是弱项'}"),
-        }
+
+def adversary_label(scenario: torch.Tensor) -> torch.Tensor:
+    """对抗者生成的场景，用几何最优作为标签——
+    本质是从合成场景反算最优动作，让大脑学会处理这些边角情况。"""
+    # 反归一化前 6 维：cue / target / pocket（取前 6 维）
+    pos = (scenario[..., :6] + 1) / 2 * torch.tensor(
+        [TABLE_W, TABLE_H, TABLE_W, TABLE_H, TABLE_W, TABLE_H], device=scenario.device,
+    )
+    cue, target, pocket = pos[..., :2], pos[..., 2:4], pos[..., 4:6]
+    return _optimal_action(cue, target, pocket)
 
 
 # ---------------------------------------------------------------------------
-# 4. CurriculumDesigner —— 自我设计小模型并组合成阶段化课程
+# 5. 训练阶段化组合
 # ---------------------------------------------------------------------------
-class CurriculumDesigner:
-    """根据当前大脑状态，自我设计下一阶段的小模型组合。
+@dataclass
+class TrainConfig:
+    epochs: int = 30
+    batch_size: int = 256
+    expert_steps_per_type: int = 1500
+    distill_steps: int = 2000
+    adv_steps: int = 800
+    lr: float = 3e-4
+    device: str = "cpu"
+    use_adversary: bool = True
 
-    "组合化训练"的本质：不是单独练每个技能，是把几个相关小模型串成一个组合训练，
-    每天的训练就是几个小模型一起前进，最后再融合到大模型里。
+
+def train_experts(brain: BrainModel, cfg: TrainConfig) -> dict[str, float]:
+    """Stage 1：每个 expert 单独训练在自己的专项数据上。"""
+    losses = {}
+    device = torch.device(cfg.device)
+    for name in brain.expert_names:
+        expert = brain.experts[name]
+        opt = torch.optim.Adam(expert.parameters(), lr=cfg.lr)
+        X, y = sample_scenarios(cfg.expert_steps_per_type, scenario_type=name, seed=hash(name) & 0xFFFF)
+        X, y = X.to(device), y.to(device)
+        loader = DataLoader(TensorDataset(X, y), batch_size=cfg.batch_size, shuffle=True)
+        last = 0.0
+        for _ in range(cfg.epochs):
+            ep_loss = 0.0
+            for xb, yb in loader:
+                pred = expert(xb)
+                loss = F.mse_loss(pred, yb)
+                opt.zero_grad(); loss.backward(); opt.step()
+                ep_loss += loss.item() * len(xb)
+            last = ep_loss / len(X)
+        losses[name] = last
+        print(f"  [Expert] {name:18s}  final MSE = {last:.5f}")
+    return losses
+
+
+def distill_to_brain(brain: BrainModel, cfg: TrainConfig) -> float:
+    """Stage 2：用混合数据训练大脑（experts 已预训练，让 gating + refine 学会调度）。"""
+    device = torch.device(cfg.device)
+    X, y = sample_scenarios(cfg.distill_steps, scenario_type=None, seed=2024)
+    X, y = X.to(device), y.to(device)
+    loader = DataLoader(TensorDataset(X, y), batch_size=cfg.batch_size, shuffle=True)
+
+    # 蒸馏阶段：experts 学习率较小（fine-tune），gating/refine 正常
+    expert_params = [p for e in brain.experts.values() for p in e.parameters()]
+    head_params = list(brain.gating.parameters()) + list(brain.refine.parameters())
+    opt = torch.optim.Adam([
+        {"params": expert_params, "lr": cfg.lr * 0.1},
+        {"params": head_params,   "lr": cfg.lr},
+    ])
+    last = 0.0
+    for ep in range(cfg.epochs):
+        ep_loss = 0.0
+        for xb, yb in loader:
+            pred = brain(xb)
+            loss = F.mse_loss(pred, yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += loss.item() * len(xb)
+        last = ep_loss / len(X)
+        if (ep + 1) % max(1, cfg.epochs // 5) == 0:
+            print(f"  [Distill] epoch {ep+1:3d}  MSE = {last:.5f}")
+    return last
+
+
+def adversarial_round(brain: BrainModel, cfg: TrainConfig) -> tuple[float, float]:
+    """Stage 3：小模型 Adversary 生成难题 → 反过来训练大脑。
+
+    交替优化：
+      ▸ Adversary 步：固定 brain，最大化 brain 的预测误差。
+      ▸ Brain 步：固定 adversary（用它生成的场景），最小化误差。
     """
+    device = torch.device(cfg.device)
+    adv = Adversary().to(device)
+    opt_adv = torch.optim.Adam(adv.parameters(), lr=cfg.lr)
+    opt_brain = torch.optim.Adam(brain.parameters(), lr=cfg.lr * 0.5)
 
-    @staticmethod
-    def design_session(brain: BrainModel, n_modules: int = 3) -> dict:
-        """设计今天的训练 session：选 n 个小模型组合训练。"""
-        targets = brain.weakest_unlockable(n_modules)
-        if not targets:
-            # 全部解锁？挑 mastery < 1.0 的随机几个
-            targets = [s for s in brain.skills.values() if s.mastery < 1.0][:n_modules]
+    last_adv_obj, last_brain_loss = 0.0, 0.0
+    for step in range(cfg.adv_steps):
+        # ── (a) Adversary 步：造难题
+        for p in brain.parameters(): p.requires_grad_(False)
+        scenario = adv(cfg.batch_size, device)
+        with torch.no_grad():
+            target = adversary_label(scenario)
+        pred = brain(scenario)
+        adv_obj = -F.mse_loss(pred, target)  # 最大化误差 = 最小化负误差
+        opt_adv.zero_grad(); adv_obj.backward(); opt_adv.step()
+        last_adv_obj = -adv_obj.item()
+        for p in brain.parameters(): p.requires_grad_(True)
 
-        total_minutes = 0
-        plan = []
-        for t in targets:
-            # 难度越高，建议时长越长（难技能需要更多反复）
-            minutes = int(15 + 25 * t.difficulty)
-            total_minutes += minutes
-            plan.append({
-                "skill": t.name,
-                "cn": t.cn_name,
-                "section": t.section,
-                "current_mastery": round(t.mastery, 3),
-                "minutes": minutes,
-                "drills": t.drills,
-            })
+        # ── (b) Brain 步：从难题里学习
+        with torch.no_grad():
+            scenario = adv(cfg.batch_size, device).detach()
+        target = adversary_label(scenario)
+        pred = brain(scenario)
+        brain_loss = F.mse_loss(pred, target)
+        opt_brain.zero_grad(); brain_loss.backward(); opt_brain.step()
+        last_brain_loss = brain_loss.item()
 
-        return {
-            "stage": brain.stage(),
-            "overall_score": round(brain.overall_score(), 3),
-            "total_minutes": total_minutes,
-            "session": plan,
-            "philosophy": CurriculumDesigner._pick_philosophy(brain),
-        }
-
-    @staticmethod
-    def _pick_philosophy(brain: BrainModel) -> str:
-        """每个阶段配一句心法（呼应 README §17–§20）。"""
-        s = brain.overall_score()
-        if s < 0.20: return "稳 > 力 > 准——动作不稳，再准也是偶然 (§十.1)"
-        if s < 0.40: return "稳定来自流程——固定预击球节拍 (§17.稳)"
-        if s < 0.60: return "母球走短不走长——走位的鲁棒性 > 精度 (§9.2.6)"
-        if s < 0.80: return "打之前先想白球去哪——而不是这球能不能进 (§十.2)"
-        return "Be water——形随境变、本质不变 (§18.2)"
+        if (step + 1) % max(1, cfg.adv_steps // 5) == 0:
+            print(f"  [Adv] step {step+1:4d}  adv_attack={last_adv_obj:.5f}  brain_recover={last_brain_loss:.5f}")
+    return last_adv_obj, last_brain_loss
 
 
 # ---------------------------------------------------------------------------
-# 5. SelfTrainer —— 主循环：诊断 → 设计 → 训练 → 对抗 → 集成
+# 6. 评估 & 弱点诊断
 # ---------------------------------------------------------------------------
-class SelfTrainer:
-    def __init__(self, brain: BrainModel | None = None):
-        self.brain = brain or BrainModel.fresh()
+@torch.no_grad()
+def eval_per_skill(brain: BrainModel, cfg: TrainConfig, n: int = 1000) -> dict[str, float]:
+    """对每个场景类型评估大脑误差——找出最弱的 expert/技能。"""
+    device = torch.device(cfg.device)
+    brain.eval()
+    out = {}
+    for t in SCENARIO_TYPES:
+        X, y = sample_scenarios(n, scenario_type=t, seed=9999)
+        X, y = X.to(device), y.to(device)
+        pred = brain(X)
+        out[t] = F.mse_loss(pred, y).item()
+    brain.train()
+    return out
 
-    @classmethod
-    def load(cls) -> "SelfTrainer":
-        if STATE_PATH.exists():
-            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            brain = BrainModel.fresh()
-            for name, m in data.get("mastery", {}).items():
-                if name in brain.skills:
-                    brain.skills[name].mastery = m
-            brain.history = data.get("history", [])
-            return cls(brain)
-        return cls()
 
-    def save(self) -> None:
-        data = {
-            "mastery": {n: s.mastery for n, s in self.brain.skills.items()},
-            "history": self.brain.history,
-        }
-        STATE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+@torch.no_grad()
+def gating_distribution(brain: BrainModel, cfg: TrainConfig, n: int = 500) -> dict[str, dict[str, float]]:
+    """看大脑遇到不同场景时，门控网络给每个 expert 多大权重——
+    可以验证大脑是否学会了"看局面调专家"。"""
+    device = torch.device(cfg.device)
+    brain.eval()
+    out = {}
+    for t in SCENARIO_TYPES:
+        X, _ = sample_scenarios(n, scenario_type=t, seed=8888)
+        X = X.to(device)
+        w = brain.gate_weights(X).mean(dim=0)
+        out[t] = {n: w[i].item() for i, n in enumerate(brain.expert_names)}
+    brain.train()
+    return out
 
-    def run_one_cycle(self, intensity: float = 1.0) -> dict:
-        """一轮完整循环：诊断 → 设计课程 → 模拟训练 → 对抗挑战 → 集成进度。"""
-        before = self.brain.overall_score()
-        session = CurriculumDesigner.design_session(self.brain, n_modules=3)
 
-        gains = {}
-        for entry in session["session"]:
-            skill = self.brain.skills[entry["skill"]]
-            gain = skill.train_one_round(intensity)
-            gains[skill.name] = round(gain, 4)
-
-        challenge = Adversary.challenge(self.brain)
-        if challenge["verdict"] == "FAIL":
-            forced = self.brain.skills[challenge["target"]]
-            extra = forced.train_one_round(intensity * 0.6)
-            gains[forced.name] = round(gains.get(forced.name, 0) + extra, 4)
-
-        after = self.brain.overall_score()
-        record = {
-            "before": round(before, 3),
-            "after": round(after, 3),
-            "delta": round(after - before, 4),
-            "session": [e["skill"] for e in session["session"]],
-            "gains": gains,
-            "challenge": challenge["verdict"],
-            "challenge_target": challenge.get("target"),
-        }
-        self.brain.history.append(record)
-        return {"session": session, "challenge": challenge, "result": record}
-
-    def make_plan(self, days: int = 7) -> list[dict]:
-        """生成 N 天训练计划——每天一个组合 session。不实际训练，只规划。"""
-        # 用快照模拟，不动当前 brain
-        snapshot = BrainModel.fresh()
-        for n, s in self.brain.skills.items():
-            snapshot.skills[n].mastery = s.mastery
-
-        plan = []
-        for day in range(1, days + 1):
-            session = CurriculumDesigner.design_session(snapshot, n_modules=3)
-            plan.append({"day": day, **session})
-            # 模拟训练以推进快照（让后续天的课程往前演进）
-            for entry in session["session"]:
-                snapshot.skills[entry["skill"]].train_one_round(intensity=1.0)
-        return plan
+def self_design_reweight(brain: BrainModel, per_skill_loss: dict[str, float],
+                         cfg: TrainConfig, factor: float = 2.0) -> None:
+    """自我设计：找出最弱场景类型，给那个 expert 单独加训。
+    这就是"自我设计小模型 引导训练你自己大脑的模型"。"""
+    weakest = max(per_skill_loss, key=per_skill_loss.get)
+    print(f"  [Self-design] 诊断最弱项: {weakest} (MSE={per_skill_loss[weakest]:.5f})  → 强化训练")
+    expert = brain.experts[weakest]
+    opt = torch.optim.Adam(expert.parameters(), lr=cfg.lr)
+    device = torch.device(cfg.device)
+    X, y = sample_scenarios(int(cfg.expert_steps_per_type * factor),
+                            scenario_type=weakest, seed=hash(weakest) & 0xFFFF)
+    X, y = X.to(device), y.to(device)
+    loader = DataLoader(TensorDataset(X, y), batch_size=cfg.batch_size, shuffle=True)
+    for _ in range(cfg.epochs):
+        for xb, yb in loader:
+            loss = F.mse_loss(expert(xb), yb)
+            opt.zero_grad(); loss.backward(); opt.step()
 
 
 # ---------------------------------------------------------------------------
-# 6. CLI —— 让这套框架真正能用
+# 7. 主流程：完整自训练循环
 # ---------------------------------------------------------------------------
-def _print_session(out: dict) -> None:
-    s = out["session"]
-    print(f"\n=== 当前阶段 ===\n{s['stage']}")
-    print(f"整体水平 (overall_score) = {s['overall_score']:.3f}")
-    print(f"心法：{s['philosophy']}")
-    print(f"\n=== 今日训练 session（共 {s['total_minutes']} 分钟）===")
-    for i, e in enumerate(s["session"], 1):
-        print(f"\n  [{i}] {e['cn']} (§{e['section']})  —  {e['minutes']} 分钟")
-        print(f"      当前 mastery: {e['current_mastery']:.2f}")
-        print(f"      训练内容:")
-        for d in e["drills"]:
-            print(f"        • {d}")
-    c = out["challenge"]
-    print(f"\n=== 对抗者挑战（小模型 vs 大脑）===\n  {c['msg']}")
-    r = out["result"]
-    print(f"\n=== 本轮收益 ===\n  整体水平 {r['before']:.3f} → {r['after']:.3f}  (Δ {r['delta']:+.4f})")
-    for k, v in r["gains"].items():
-        print(f"    + {k:18s} mastery +{v:.4f}")
+def train(cfg: TrainConfig, ckpt: Path = CKPT_PATH) -> BrainModel:
+    torch.manual_seed(0)
+    brain = BrainModel(SCENARIO_TYPES).to(cfg.device)
+
+    print("\n=== Stage 1: 各小模型 (Expert) 专项预训练 ===")
+    train_experts(brain, cfg)
+
+    print("\n=== Stage 2: 蒸馏 — 小模型们共同训练大脑 (MoE 门控学习) ===")
+    distill_to_brain(brain, cfg)
+
+    print("\n=== Stage 3: 自我诊断 + 自我设计弱项强化 ===")
+    losses = eval_per_skill(brain, cfg)
+    for t, l in losses.items():
+        print(f"  {t:18s}  MSE = {l:.5f}")
+    self_design_reweight(brain, losses, cfg)
+
+    if cfg.use_adversary:
+        print("\n=== Stage 4: 对抗训练 — 小模型造难题打败大脑，倒逼提升 ===")
+        adversarial_round(brain, cfg)
+
+    print("\n=== 最终评估：大脑各场景表现 + 门控分布 ===")
+    final_losses = eval_per_skill(brain, cfg)
+    for t, l in final_losses.items():
+        delta = l - losses[t]
+        sym = "↓" if delta < 0 else "↑"
+        print(f"  {t:18s}  MSE = {l:.5f}  ({sym} {abs(delta):.5f} vs Stage 2)")
+
+    print("\n  Gating 分布（每类场景下大脑调用各 expert 的权重）:")
+    gates = gating_distribution(brain, cfg)
+    print(f"  {'场景\\专家':<18s} " + " ".join(f"{n:>10s}" for n in brain.expert_names))
+    for t, w in gates.items():
+        row = " ".join(f"{w[n]:>10.3f}" for n in brain.expert_names)
+        print(f"  {t:<18s} {row}")
+
+    torch.save({"state_dict": brain.state_dict(), "experts": brain.expert_names}, ckpt)
+    print(f"\n✓ 已保存到 {ckpt}")
+    return brain
 
 
-def _print_plan(plan: list[dict]) -> None:
-    print(f"\n=== {len(plan)} 天训练计划 ===")
-    for day in plan:
-        print(f"\n— Day {day['day']} | {day['stage']} | {day['total_minutes']} 分钟")
-        print(f"  心法：{day['philosophy']}")
-        for e in day["session"]:
-            print(f"  • {e['cn']:20s} (§{e['section']:8s}) {e['minutes']:3d} min  "
-                  f"mastery={e['current_mastery']:.2f}")
+def evaluate(ckpt: Path, cfg: TrainConfig) -> None:
+    data = torch.load(ckpt, map_location=cfg.device, weights_only=False)
+    brain = BrainModel(data["experts"]).to(cfg.device)
+    brain.load_state_dict(data["state_dict"])
+    print("=== 评估已训练大脑 ===")
+    losses = eval_per_skill(brain, cfg)
+    for t, l in losses.items():
+        print(f"  {t:18s}  MSE = {l:.5f}")
 
 
-def _print_eval(brain: BrainModel) -> None:
-    print(f"\n=== 大脑模型评估 ===")
-    print(f"阶段：{brain.stage()}")
-    print(f"整体水平：{brain.overall_score():.3f}")
-    print(f"\n各小模型 mastery（按依赖顺序）:")
-    for s in brain.skills.values():
-        bar = "█" * int(s.mastery * 20) + "·" * (20 - int(s.mastery * 20))
-        unlocked = "✓" if s.is_unlockable(brain) else "🔒"
-        print(f"  {unlocked} {s.cn_name:18s} (§{s.section:8s}) [{bar}] {s.mastery:.2f}  D={s.difficulty:.2f}")
-    print(f"\n历史训练轮数：{len(brain.history)}")
-
-
+# ---------------------------------------------------------------------------
+# 8. CLI
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Self-train your brain billiards model.")
-    parser.add_argument("--plan", type=int, metavar="DAYS",
-                        help="只生成 N 天训练计划，不实际训练")
-    parser.add_argument("--eval", action="store_true",
-                        help="只评估当前大脑模型，不训练")
-    parser.add_argument("--cycles", type=int, default=1,
-                        help="跑几轮自我训练循环（默认 1）")
-    parser.add_argument("--intensity", type=float, default=1.0,
-                        help="训练强度（默认 1.0；0.5 = 半强度休息日）")
-    parser.add_argument("--reset", action="store_true",
-                        help="清空进度从头来")
-    parser.add_argument("--seed", type=int, default=None)
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--expert-steps", type=int, default=1500,
+                        help="每个 expert 的训练样本数")
+    parser.add_argument("--distill-steps", type=int, default=2000)
+    parser.add_argument("--adv-steps", type=int, default=800)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--no-adversary", action="store_true")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--ckpt", type=Path, default=CKPT_PATH)
     args = parser.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed)
-
-    if args.reset and STATE_PATH.exists():
-        STATE_PATH.unlink()
-        print("进度已清空。")
-
-    trainer = SelfTrainer.load()
-
-    if args.eval:
-        _print_eval(trainer.brain)
-        return
-
-    if args.plan:
-        plan = trainer.make_plan(days=args.plan)
-        _print_plan(plan)
-        return
-
-    for i in range(args.cycles):
-        if args.cycles > 1:
-            print(f"\n========== Cycle {i+1}/{args.cycles} ==========")
-        out = trainer.run_one_cycle(intensity=args.intensity)
-        _print_session(out)
-    trainer.save()
-    print(f"\n进度已保存到 {STATE_PATH}")
+    cfg = TrainConfig(
+        epochs=args.epochs, batch_size=args.batch_size,
+        expert_steps_per_type=args.expert_steps,
+        distill_steps=args.distill_steps, adv_steps=args.adv_steps,
+        lr=args.lr, device=args.device, use_adversary=not args.no_adversary,
+    )
+    if args.eval_only:
+        evaluate(args.ckpt, cfg)
+    else:
+        train(cfg, args.ckpt)
 
 
 if __name__ == "__main__":
